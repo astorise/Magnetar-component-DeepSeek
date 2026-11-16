@@ -12,38 +12,57 @@ or Devices).
 
 ## Status
 
-**Empty template.** This crate is a scaffold: no DeepSeek graph logic, no WIT
-bindings and no Component Model exports exist here yet, and the Runtime has
-no DeepSeek implementation of its own either. It is pinned into Magnetar as a
-placeholder so the work has a home; it is not yet scheduled against an
-OpenSpec change of its own.
+**Implemented for the DeepSeekMoE decoder shape; MLA is not supported.**
+`src/lib.rs` builds prefill, decode and layer-segment Execution Graphs
+through `magnetar:model-component-graph@1.6.0` (vendored under `wit/`),
+reading every dimension from `model-config` on each call.
 
-## What this family needs
+Supported:
 
-What sets this family apart from the generic decoder block
-`components/qwen` and `components/llama` already implement, each to be
-checked against the exact pinned checkpoint's `config.json` before it is
-implemented:
+- pre-norm decoder layers, multi-head or grouped-query attention, half-split
+  RoPE, no projection bias, optional tied embeddings;
+- a dense gated MLP, or DeepSeekMoE: routed experts (`moe-experts`, softmax
+  top-k, optional renormalisation) plus shared experts as an *ungated* gated
+  MLP added to the routed output (unlike Qwen's sigmoid-gated one).
 
-- DeepSeek-V2/V3 use Multi-head Latent Attention: keys and values are reconstructed from a compressed per-token latent, so the KV cache stores that latent (plus a decoupled RoPE key) rather than per-head keys and values. Neither the attention Operator nor the KV layout models this today.
-- DeepSeekMoE: shared experts plus many fine-grained routed experts per layer, with data-dependent top-k routing that must stay on the Device for step replay to keep working (`execute-and-cache-moe-experts`).
-- DeepSeek-V3 adds multi-token prediction heads (`verify-speculative-and-mtp-generation`) and ships FP8 weights (`explore-checkpoint-native-low-precision`).
-- The DeepSeek-R1 distilled checkpoints are Qwen2.5 and Llama models; they already run through `components/qwen` and `components/llama`, not this Component.
+Refused with an explicit error rather than approximated (`unsupported_reason`):
+attention bias, RoPE scaling (linear factor or per-frequency, e.g. YaRN), per-layer geometry, final
+logit softcapping, per-layer input embeddings, inconsistent head or expert
+counts.
+
+Not expressible through the contract today, so not implemented:
+
+- **Multi-head Latent Attention** (DeepSeek-V2/V3): the contract has a single
+  `head-dimension`, no latent KV state, no decoupled RoPE key and no
+  multi-output nodes, and `model-config` carries none of `kv_lora_rank`,
+  `q_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`.
+- **Dense leading layers** (`first_k_dense_replace`): `mixture-of-experts`
+  applies to every layer, so a checkpoint mixing dense and MoE layers (such as
+  DeepSeek-MoE-16B) cannot be described faithfully yet.
+- V3 sigmoid routing with correction bias, group-limited routing,
+  `routed_scaling_factor`, multi-token prediction and FP8 weights.
+
+The DeepSeek-R1 distilled checkpoints are Qwen2.5 and Llama models and run
+through `components/qwen` and `components/llama`, not this Component.
 
 ## Governing contract
 
-None dedicated yet. A real implementation will target the same
-`model-component-graph-contract` WIT interface (`magnetar:model-component-graph`)
-`components/qwen` and `components/llama` implement, extended additively
-where this family needs Operators or state the contract does not model yet.
-Family-specific requirements will be scoped in the main repository's
-`openspec/` (the `qualify-additional-model-and-state-families` change tracks
-qualifying new families).
+This Component implements the `magnetar:model-component-graph` world exactly
+as `components/qwen` and `components/llama` do. Family-specific requirements
+are scoped in the main repository's `openspec/`
+(`qualify-additional-model-and-state-families`).
 
 ## Relationship to magnetar-runtime
 
-This Component will be loaded and validated by the Runtime's Component
+This Component is loaded and validated by the Runtime's Component
 Engine (Wasmtime-backed on native targets, browser-hosted on `wasm32`) and
-never run with direct hardware, filesystem, or network access. It is
+never runs with direct hardware, filesystem, or network access. It is
 pinned into the main [Magnetar](https://github.com/astorise/Magnetar)
 repository as a git submodule at `components/deepseek`.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` calls the Module CI workflow the main Magnetar
+repository defines once for all module repositories (formatting, Clippy,
+tests with the committed `Cargo.lock`, `cargo-deny`), building this crate at
+`components/deepseek` inside a Magnetar checkout.

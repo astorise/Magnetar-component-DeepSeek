@@ -26,7 +26,7 @@ Supported:
   MLP added to the routed output (unlike Qwen's sigmoid-gated one).
 
 Refused with an explicit error rather than approximated (`unsupported_reason`):
-attention bias, per-frequency RoPE scaling (YaRN), per-layer geometry, final
+attention bias, RoPE scaling (linear factor or per-frequency, e.g. YaRN), per-layer geometry, final
 logit softcapping, per-layer input embeddings, inconsistent head or expert
 counts.
 

@@ -44,6 +44,8 @@ pub struct SupportFacts {
     pub num_attention_heads: u32,
     pub num_key_value_heads: u32,
     pub has_rope_scaling: bool,
+    /// `architecture-config.rope-scaling-factor`: a linear scaling factor.
+    pub rope_scaling_factor: Option<f64>,
     pub has_layer_layout: bool,
     pub has_final_logit_softcapping: bool,
     pub has_per_layer_input: bool,
@@ -76,6 +78,12 @@ pub fn unsupported_reason(facts: &SupportFacts) -> Option<String> {
     if facts.has_rope_scaling {
         return Some("per-frequency RoPE scaling (e.g. YaRN) is not applied".into());
     }
+    if facts
+        .rope_scaling_factor
+        .is_some_and(|factor| factor != 1.0)
+    {
+        return Some("a linear RoPE scaling factor is not applied".into());
+    }
     if facts.has_layer_layout {
         return Some("per-layer attention geometry is not applied".into());
     }
@@ -106,6 +114,7 @@ fn facts_of(
         num_attention_heads: config.num_attention_heads,
         num_key_value_heads: config.num_key_value_heads,
         has_rope_scaling: model_config::rope_scaling().is_some(),
+        rope_scaling_factor: config.rope_scaling_factor,
         has_layer_layout: model_config::layer_layout().is_some(),
         has_final_logit_softcapping: options.final_logit_softcapping.is_some(),
         has_per_layer_input: options.per_layer_input_size.is_some(),
@@ -660,6 +669,7 @@ mod tests {
             num_attention_heads: 16,
             num_key_value_heads: 16,
             has_rope_scaling: false,
+            rope_scaling_factor: None,
             has_layer_layout: false,
             has_final_logit_softcapping: false,
             has_per_layer_input: false,
@@ -684,6 +694,11 @@ mod tests {
             ..supported()
         };
         assert_eq!(unsupported_reason(&dense), None);
+        let unit_factor = SupportFacts {
+            rope_scaling_factor: Some(1.0),
+            ..supported()
+        };
+        assert_eq!(unsupported_reason(&unit_factor), None);
     }
 
     #[test]
@@ -695,6 +710,10 @@ mod tests {
             },
             SupportFacts {
                 has_rope_scaling: true,
+                ..supported()
+            },
+            SupportFacts {
+                rope_scaling_factor: Some(4.0),
                 ..supported()
             },
             SupportFacts {

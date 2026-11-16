@@ -12,35 +12,41 @@ or Devices).
 
 ## Status
 
-**Implemented for the DeepSeekMoE decoder shape; MLA is not supported.**
-`src/lib.rs` builds prefill, decode and layer-segment Execution Graphs
-through `magnetar:model-component-graph@1.6.0` (vendored under `wit/`),
-reading every dimension from `model-config` on each call.
+**Implemented against `magnetar:model-component-graph@1.7.0`** (vendored under
+`wit/`). `src/lib.rs` builds prefill, decode and layer-segment Execution
+Graphs from `model-config` alone, and reads every `1.7.0` function on each
+build (the Runtime refuses a graph for a checkpoint whose declared feature
+was never read).
 
 Supported:
 
-- pre-norm decoder layers, multi-head or grouped-query attention, half-split
-  RoPE, no projection bias, optional tied embeddings;
-- a dense gated MLP, or DeepSeekMoE: routed experts (`moe-experts`, softmax
-  top-k, optional renormalisation) plus shared experts as an *ungated* gated
-  MLP added to the routed output (unlike Qwen's sigmoid-gated one).
+- pre-norm decoder layers, no projection bias, optional tied embeddings;
+- ordinary multi/grouped-query attention with half-split RoPE (DeepSeekMoE);
+- **Multi-head Latent Attention** (DeepSeek-V2/V2-Lite), *expanded* form:
+  split projections (`q_a_proj`/`q_a_norm` when `q_lora_rank` is set,
+  `q_nope_proj`, `q_rope_proj`, `kv_a_proj`, `kv_a_norm`, `k_rope_proj`,
+  `k_nope_proj`, `v_proj`), interleaved RoPE on the rotated parts, head-wise
+  `concat` to `[nope | rope]` for Q and K (the shared rotated key given to
+  every head), `attention` with `head_dimension` 192 and
+  `value_head_dimension` 128. K and V are cached in full; the latent cache is
+  a later Runtime milestone;
+- **YaRN** RoPE on every `rope` node, and its softmax rescaling
+  `scale = head_dim^-0.5 * mscale(factor, mscale_all_dim)^2`;
+- per layer, a dense gated MLP or DeepSeekMoE (`mixture-of-experts-layers`):
+  routed softmax top-k experts, scaled by `routed-scaling-factor`, plus shared
+  experts as an *ungated* gated MLP.
 
 Refused with an explicit error rather than approximated (`unsupported_reason`):
-attention bias, RoPE scaling (linear factor or per-frequency, e.g. YaRN), per-layer geometry, final
-logit softcapping, per-layer input embeddings, inconsistent head or expert
-counts.
+sigmoid, group-limited or biased expert routing (DeepSeek-V3, Runtime
+milestone 3), a gated shared expert, banded RoPE scaling, a linear scaling
+factor, attention bias, per-layer geometry, final logit softcapping,
+per-layer input embeddings, and inconsistent head, expert or layer counts.
 
-Not expressible through the contract today, so not implemented:
-
-- **Multi-head Latent Attention** (DeepSeek-V2/V3): the contract has a single
-  `head-dimension`, no latent KV state, no decoupled RoPE key and no
-  multi-output nodes, and `model-config` carries none of `kv_lora_rank`,
-  `q_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`.
-- **Dense leading layers** (`first_k_dense_replace`): `mixture-of-experts`
-  applies to every layer, so a checkpoint mixing dense and MoE layers (such as
-  DeepSeek-MoE-16B) cannot be described faithfully yet.
-- V3 sigmoid routing with correction bias, group-limited routing,
-  `routed_scaling_factor`, multi-token prediction and FP8 weights.
+Not verified end to end: the graphs are unit-tested for their decisions only.
+The acceptance runs (tiny random `deepseek_v2` bundles against transformers on
+the Reference CPU, then DeepSeek-V2-Lite from a quantized GGUF on CUDA) need
+this Component packaged into a Magnetar checkout. See
+[astorise/Magnetar#198](https://github.com/astorise/Magnetar/issues/198).
 
 The DeepSeek-R1 distilled checkpoints are Qwen2.5 and Llama models and run
 through `components/qwen` and `components/llama`, not this Component.

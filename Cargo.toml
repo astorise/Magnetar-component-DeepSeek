@@ -2,7 +2,7 @@
 
 [package]
 name = "magnetar-component-deepseek"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "DeepSeek model Component (WebAssembly) for the Magnetar inference runtime."

@@ -398,7 +398,8 @@ pub fn weight_tensor_name(layer: u64, suffix: &str) -> String {
     match suffix {
         "input_norm" | "post_attn_norm" => format!("layers.{layer}.{suffix}"),
         "q_proj" | "k_proj" | "v_proj" | "o_proj" | "q_a_proj" | "q_a_norm" | "q_nope_proj"
-        | "q_rope_proj" | "kv_a_proj" | "kv_a_norm" | "k_rope_proj" | "k_nope_proj" => {
+        | "q_rope_proj" | "kv_a_proj" | "kv_a_norm" | "k_rope_proj" | "k_nope_proj"
+        | "k_absorb" | "v_absorb" => {
             format!("layers.{layer}.self_attn.{suffix}")
         }
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
@@ -595,9 +596,19 @@ fn attention_attrs(heads: u64, kv_heads: u64, head_dimension: u64) -> Vec<Attrib
     ]
 }
 
-/// Multi-head Latent Attention, expanded: the loaders have split every fused
-/// projection by rows, so each part is its own matmul and a head-wise
-/// `concat` joins the position-independent and rotated parts of Q and K.
+/// Multi-head Latent Attention (`cache-latent-attention-history`). The
+/// loaders have split every fused projection by rows. The KV history is
+/// the latent row `[c_kv | k_pe]` (`kv_lora_rank + qk_rope_head_dim`
+/// values, one key head) and nothing else:
+/// - a prefill attends with each head's expanded key `[c_kv W_UK | k_pe]`
+///   and value `c_kv W_UV` (fewer operations than attending in the latent
+///   width), and writes the latent rows to the history;
+/// - a decode step absorbs each head's position-independent query into the
+///   latent space (`q_nope W_UK^T`, `batched-matmul` by `k_absorb`),
+///   attends over the latent history as one key head whose leading
+///   `kv_lora_rank` values are also the values (`value_head_stride`), and
+///   up-projects each head's latent output (`batched-matmul` by
+///   `v_absorb`). Its scores are the expanded form's, with the same scale.
 fn build_latent_attention(
     plan: &Plan,
     mla: &MlaConfig,
@@ -611,6 +622,7 @@ fn build_latent_attention(
     let heads = u64::from(plan.config.num_attention_heads);
     let (nope, rope, value) = (mla.qk_nope_head_dim, mla.qk_rope_head_dim, mla.v_head_dim);
     let qk = nope + rope;
+    let latent = u64::from(mla.kv_lora_rank);
 
     // Queries: from the hidden state, or through a low-rank bottleneck.
     let query_input = match mla.q_lora_rank {
@@ -655,10 +667,8 @@ fn build_latent_attention(
         &shape(vec![t, heads * rope]),
         None,
     );
-    let q = head_concat(prefix, "q", &q_nope, &q_pe, heads, heads, t, qk);
 
-    // Keys and values: a normalized latent, plus one shared rotated key.
-    let latent = u64::from(mla.kv_lora_rank);
+    // The normalized latent and the one shared rotated key.
     let c_kv = matmul(
         prefix,
         layer,
@@ -700,55 +710,115 @@ fn build_latent_attention(
         &shape(vec![t, rope]),
         None,
     );
-    let k_nope = matmul(
-        prefix,
-        layer,
-        "k_nope_proj",
-        "k_nope_proj",
-        &c_kv,
-        t,
-        heads * nope,
-        None,
-        None,
-    );
-    let v = matmul(
-        prefix,
-        layer,
-        "v_proj",
-        "v_proj",
-        &c_kv,
-        t,
-        heads * value,
-        None,
-        Some(&kv_involvement(layer, KvCacheRole::V, kv_append)),
-    );
-    // The key is `[k_nope | k_pe]` per head, `k_pe` being one head given to
-    // every head; it is what the K cache stores.
-    let k = add_node(
-        &format!("{prefix}.k"),
+    // The history: `[c_kv | k_pe]` per token, one head.
+    let history = add_node(
+        &format!("{prefix}.latent"),
         "concat",
         "Tensor",
-        &head_concat_attrs(heads, 1),
-        &[k_nope, k_pe],
-        &shape(vec![t, heads * qk]),
+        &head_concat_attrs(1, 1),
+        &[c_kv.clone(), k_pe.clone()],
+        &shape(vec![t, latent + rope]),
         Some(&kv_involvement(layer, KvCacheRole::K, kv_append)),
     );
+    let scale = attr("scale", AttributeValue::FloatValue(plan.softmax_scale(qk)));
 
-    let mut attributes = attention_attrs(heads, heads, qk);
+    if !kv_append {
+        // Prefill: expanded keys and values of its own rows.
+        let q = head_concat(prefix, "q", &q_nope, &q_pe, heads, heads, t, qk);
+        let k_nope = matmul(
+            prefix,
+            layer,
+            "k_nope_proj",
+            "k_nope_proj",
+            &c_kv,
+            t,
+            heads * nope,
+            None,
+            None,
+        );
+        let v = matmul(
+            prefix,
+            layer,
+            "v_proj",
+            "v_proj",
+            &c_kv,
+            t,
+            heads * value,
+            None,
+            None,
+        );
+        let k = head_concat(prefix, "k", &k_nope, &k_pe, heads, 1, t, qk);
+        let mut attributes = attention_attrs(heads, heads, qk);
+        attributes.push(attr(
+            "value_head_dimension",
+            AttributeValue::Integer(value as i64),
+        ));
+        attributes.push(scale);
+        let out = add_node(
+            &format!("{prefix}.attention"),
+            "attention",
+            "Attention",
+            &attributes,
+            &[q, k, v],
+            &shape(vec![t, heads * value]),
+            None,
+        );
+        // The history is written, not read, by a prefill.
+        let _ = history;
+        return (out, heads * value);
+    }
+
+    // Decode: absorbed queries over the latent history.
+    let q_latent = add_node(
+        &format!("{prefix}.q_absorbed"),
+        "batched-matmul",
+        "LinearAlgebra",
+        &[attr("group_count", AttributeValue::Integer(heads as i64))],
+        &[q_nope, weight_edge(&weight_tensor_name(layer, "k_absorb"))],
+        &shape(vec![t, heads * latent]),
+        None,
+    );
+    let q = head_concat(
+        prefix,
+        "q",
+        &q_latent,
+        &q_pe,
+        heads,
+        heads,
+        t,
+        latent + rope,
+    );
+    let mut attributes = attention_attrs(heads, 1, latent + rope);
     attributes.push(attr(
         "value_head_dimension",
-        AttributeValue::Integer(value as i64),
+        AttributeValue::Integer(latent as i64),
     ));
     attributes.push(attr(
-        "scale",
-        AttributeValue::FloatValue(plan.softmax_scale(qk)),
+        "value_head_stride",
+        AttributeValue::Integer((latent + rope) as i64),
     ));
-    let out = add_node(
+    attributes.push(scale);
+    let latent_out = add_node(
         &format!("{prefix}.attention"),
         "attention",
         "Attention",
         &attributes,
-        &[q, k, v],
+        &[q, history.clone(), history],
+        &shape(vec![t, heads * latent]),
+        None,
+    );
+    let out = add_node(
+        &format!("{prefix}.v_absorbed"),
+        "batched-matmul",
+        "LinearAlgebra",
+        &[
+            attr("group_count", AttributeValue::Integer(heads as i64)),
+            attr("transpose_b", AttributeValue::Boolean(true)),
+        ],
+        &[
+            latent_out,
+            weight_edge(&weight_tensor_name(layer, "v_absorb")),
+        ],
         &shape(vec![t, heads * value]),
         None,
     );

@@ -6,9 +6,10 @@
 //!
 //! - **DeepSeekMoE** (`model_type = "deepseek"`): multi-head or grouped-query
 //!   attention with half-split RoPE;
-//! - **DeepSeek-V2/V3 attention**: Multi-head Latent Attention in its
-//!   *expanded* form (K and V are cached in full; the latent cache is a later
-//!   Runtime milestone), with YaRN RoPE and its softmax rescaling;
+//! - **DeepSeek-V2/V3 attention**: Multi-head Latent Attention over a latent
+//!   KV history (`cache-latent-attention-history`): the prefill attends in the
+//!   expanded form over the history's rows (`chunk-latent-prefills`), a decode
+//!   step in the absorbed form; with YaRN RoPE and its softmax rescaling;
 //! - a feed-forward that is, per layer, a dense gated MLP or DeepSeekMoE:
 //!   routed experts plus an always-active, **ungated** shared expert.
 //!
@@ -600,9 +601,11 @@ fn attention_attrs(heads: u64, kv_heads: u64, head_dimension: u64) -> Vec<Attrib
 /// loaders have split every fused projection by rows. The KV history is
 /// the latent row `[c_kv | k_pe]` (`kv_lora_rank + qk_rope_head_dim`
 /// values, one key head) and nothing else:
-/// - a prefill attends with each head's expanded key `[c_kv W_UK | k_pe]`
-///   and value `c_kv W_UV` (fewer operations than attending in the latent
-///   width), and writes the latent rows to the history;
+/// - a prefill writes the latent rows to the history and attends over it
+///   with each head's expanded key `[c_kv W_UK | k_pe]` and value
+///   `c_kv W_UV` (`latent_kv_width`: the Provider expands the rows it
+///   reads; fewer operations than attending in the latent width), so its
+///   passes over a long prompt see the earlier ones (`chunk-latent-prefills`);
 /// - a decode step absorbs each head's position-independent query into the
 ///   latent space (`q_nope W_UK^T`, `batched-matmul` by `k_absorb`),
 ///   attends over the latent history as one key head whose leading
@@ -723,35 +726,20 @@ fn build_latent_attention(
     let scale = attr("scale", AttributeValue::FloatValue(plan.softmax_scale(qk)));
 
     if !kv_append {
-        // Prefill: expanded keys and values of its own rows.
+        // Prefill: attends over the latent history its `latent` node
+        // writes (its own rows after any earlier pass's), each head's key
+        // `[c_kv W_UK | k_pe]` and value `c_kv W_UV` expanded by the
+        // Provider (`latent_kv_width`, `chunk-latent-prefills`), so a long
+        // prompt can run in passes that see the earlier ones.
         let q = head_concat(prefix, "q", &q_nope, &q_pe, heads, heads, t, qk);
-        let k_nope = matmul(
-            prefix,
-            layer,
-            "k_nope_proj",
-            "k_nope_proj",
-            &c_kv,
-            t,
-            heads * nope,
-            None,
-            None,
-        );
-        let v = matmul(
-            prefix,
-            layer,
-            "v_proj",
-            "v_proj",
-            &c_kv,
-            t,
-            heads * value,
-            None,
-            None,
-        );
-        let k = head_concat(prefix, "k", &k_nope, &k_pe, heads, 1, t, qk);
         let mut attributes = attention_attrs(heads, heads, qk);
         attributes.push(attr(
             "value_head_dimension",
             AttributeValue::Integer(value as i64),
+        ));
+        attributes.push(attr(
+            "latent_kv_width",
+            AttributeValue::Integer(latent as i64),
         ));
         attributes.push(scale);
         let out = add_node(
@@ -759,12 +747,16 @@ fn build_latent_attention(
             "attention",
             "Attention",
             &attributes,
-            &[q, k, v],
+            &[
+                q,
+                history.clone(),
+                history,
+                weight_edge(&weight_tensor_name(layer, "k_nope_proj")),
+                weight_edge(&weight_tensor_name(layer, "v_proj")),
+            ],
             &shape(vec![t, heads * value]),
             None,
         );
-        // The history is written, not read, by a prefill.
-        let _ = history;
         return (out, heads * value);
     }
 

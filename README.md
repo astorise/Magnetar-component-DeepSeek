@@ -2,7 +2,7 @@
 
 ## Purpose
 
-A WebAssembly Component implementing DeepSeek and compatible GLM latent-attention graphs for the
+A WebAssembly Component implementing DeepSeek and compatible GLM/Kimi latent-attention graphs for the
 [Magnetar](https://github.com/astorise/Magnetar) local AI Runtime. It will
 supply prefill/decode graph semantics for DeepSeek-compatible Model Artifacts
 through the Runtime's Model Component contract, without ever selecting a
@@ -44,10 +44,11 @@ scoring modes, a gated shared expert, banded RoPE scaling, a linear scaling
 factor, attention bias, per-layer geometry, final logit softcapping,
 per-layer input embeddings, and inconsistent head, expert or layer counts.
 
-In the Magnetar checkout, tiny synthetic `deepseek_v2` and `glm4_moe_lite`
+In the Magnetar checkout, tiny synthetic `deepseek_v2`, `glm4_moe_lite` and `kimi_k2`
 bundles are compared with Transformers on CPU for prefill and cached decode.
-GLM's top-1 and grouped top-2 routing are tested separately. The full GLM
-checkpoint and CUDA sigmoid routing have not been qualified.
+GLM's and Kimi's distinct top-1 behavior and top-2 routing are tested
+separately, including Kimi E4M3FN weights. Full published GLM/Kimi checkpoints
+and CUDA sigmoid routing have not been qualified.
 
 The DeepSeek-R1 distilled checkpoints are Qwen2.5 and Llama models and run
 through `components/qwen` and `components/llama`, not this Component.

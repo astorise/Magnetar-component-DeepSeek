@@ -12,11 +12,12 @@ or Devices).
 
 ## Status
 
-**Implemented against `magnetar:model-component-graph@1.7.0`** (vendored under
+**Implemented against `magnetar:model-component-graph@1.8.0`** (vendored under
 `wit/`). `src/lib.rs` builds prefill, decode and layer-segment Execution
 Graphs from `model-config` alone, and reads every `1.7.0` function on each
 build (the Runtime refuses a graph for a checkpoint whose declared feature
-was never read).
+was never read). It requires the checkpoint activation to be known and equal
+to `silu`.
 
 Supported:
 

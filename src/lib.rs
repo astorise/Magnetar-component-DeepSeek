@@ -254,10 +254,15 @@ struct Plan {
 }
 
 impl Plan {
-    /// Reads every `model-config` function, the `1.7.0` ones included (the
+    /// Reads the `model-config` features this Component supports (the
     /// Runtime refuses a graph for a checkpoint whose declared feature was
     /// never read), and refuses what this Component cannot build.
     fn read() -> Self {
+        match model_config::hidden_activation().as_deref() {
+            Some("silu") => {}
+            Some(other) => panic!("the DeepSeek Component does not support activation {other:?}"),
+            None => panic!("the DeepSeek Component requires a known checkpoint activation"),
+        }
         let config = model_config::model_config();
         let options = model_config::options();
         let moe = model_config::mixture_of_experts();

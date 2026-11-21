@@ -2,7 +2,7 @@
 
 ## Purpose
 
-A WebAssembly Component implementing the DeepSeek model families for the
+A WebAssembly Component implementing DeepSeek and compatible GLM latent-attention graphs for the
 [Magnetar](https://github.com/astorise/Magnetar) local AI Runtime. It will
 supply prefill/decode graph semantics for DeepSeek-compatible Model Artifacts
 through the Runtime's Model Component contract, without ever selecting a
@@ -12,7 +12,7 @@ or Devices).
 
 ## Status
 
-**Implemented against `magnetar:model-component-graph@1.8.0`** (vendored under
+**Implemented against `magnetar:model-component-graph@1.10.0`** (vendored under
 `wit/`). `src/lib.rs` builds prefill, decode and layer-segment Execution
 Graphs from `model-config` alone, and reads every `1.7.0` function on each
 build (the Runtime refuses a graph for a checkpoint whose declared feature
@@ -28,26 +28,26 @@ Supported:
   `q_nope_proj`, `q_rope_proj`, `kv_a_proj`, `kv_a_norm`, `k_rope_proj`,
   `k_nope_proj`, `v_proj`), interleaved RoPE on the rotated parts, head-wise
   `concat` to `[nope | rope]` for Q and K (the shared rotated key given to
-  every head), `attention` with `head_dimension` 192 and
-  `value_head_dimension` 128. K and V are cached in full; the latent cache is
-  a later Runtime milestone;
+  every head), with the checkpoint's declared widths. Prefill expands the
+  latent cache and decode uses absorbed query/key and value projections;
 - **YaRN** RoPE on every `rope` node, and its softmax rescaling
   `scale = head_dim^-0.5 * mscale(factor, mscale_all_dim)^2`;
-- per layer, a dense gated MLP or DeepSeekMoE (`mixture-of-experts-layers`):
-  routed softmax top-k experts, scaled by `routed-scaling-factor`, plus shared
-  experts as an *ungated* gated MLP.
+- per layer, a dense gated MLP or mixture of experts
+  (`mixture-of-experts-layers`): softmax routing, or selection-biased sigmoid
+  routing with optional top-two group scoring and explicit normalization.
+  The routed output is scaled and shared experts use an ungated gated MLP;
+- a separate epsilon for the query/KV bottleneck norms when declared.
 
 Refused with an explicit error rather than approximated (`unsupported_reason`):
-sigmoid, group-limited or biased expert routing (DeepSeek-V3, Runtime
-milestone 3), a gated shared expert, banded RoPE scaling, a linear scaling
+sigmoid routing without its bias or explicit normalization, other grouped
+scoring modes, a gated shared expert, banded RoPE scaling, a linear scaling
 factor, attention bias, per-layer geometry, final logit softcapping,
 per-layer input embeddings, and inconsistent head, expert or layer counts.
 
-Not verified end to end: the graphs are unit-tested for their decisions only.
-The acceptance runs (tiny random `deepseek_v2` bundles against transformers on
-the Reference CPU, then DeepSeek-V2-Lite from a quantized GGUF on CUDA) need
-this Component packaged into a Magnetar checkout. See
-[astorise/Magnetar#198](https://github.com/astorise/Magnetar/issues/198).
+In the Magnetar checkout, tiny synthetic `deepseek_v2` and `glm4_moe_lite`
+bundles are compared with Transformers on CPU for prefill and cached decode.
+GLM's top-1 and grouped top-2 routing are tested separately. The full GLM
+checkpoint and CUDA sigmoid routing have not been qualified.
 
 The DeepSeek-R1 distilled checkpoints are Qwen2.5 and Llama models and run
 through `components/qwen` and `components/llama`, not this Component.

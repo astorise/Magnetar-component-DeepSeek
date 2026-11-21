@@ -1,5 +1,5 @@
 //! DeepSeek Model Component for the Magnetar local AI Runtime
-//! (`magnetar:model-component-graph@1.7.0`).
+//! (`magnetar:model-component-graph@1.10.0`).
 //!
 //! Builds prefill and decode Execution Graphs for the DeepSeek decoder
 //! families, from `model-config` alone:
@@ -16,9 +16,10 @@
 //! The Runtime refuses a graph built without reading a `1.7.0` function whose
 //! feature the checkpoint declares, so every build reads all of them. What
 //! this Component does not apply it refuses to build rather than ignores (see
-//! [`unsupported_reason`]): sigmoid or group-limited routing, selection bias
-//! (DeepSeek-V3, Runtime milestone 3), banded RoPE scaling, a linear scaling
-//! factor, per-layer geometry, softcapping and per-layer inputs.
+//! [`unsupported_reason`]): unsupported routing modes, banded RoPE scaling,
+//! a linear scaling factor, per-layer geometry, softcapping and per-layer
+//! inputs. Selection-biased sigmoid routing is supported when its explicit
+//! normalization mode and, if present, top-two group scoring are declared.
 //!
 //! DeepSeek-R1 *distilled* checkpoints are Qwen2.5 and Llama models and run
 //! through those Components, not this one.
@@ -33,8 +34,8 @@ use magnetar::model_component_graph::graph_builder::{
     alias_weight_edge, begin_graph, declare_input, finish_graph, kv_resource, weight_edge,
 };
 use magnetar::model_component_graph::model_config::{
-    self, ArchitectureConfig, ExpertRoutingConfig, ExpertScoring, MlaConfig, MoeConfig,
-    RopeFrequencyScaling, YarnRopeScaling,
+    self, ArchitectureConfig, ExpertGroupScore, ExpertNormalizationMode, ExpertRoutingConfig,
+    ExpertScoring, MlaConfig, MoeConfig, RopeFrequencyScaling, YarnRopeScaling,
 };
 
 /// The architecture family this Component serves.
@@ -73,6 +74,8 @@ pub struct MoeFacts {
 pub struct RoutingFacts {
     pub sigmoid: bool,
     pub has_groups: bool,
+    pub top_two_groups: bool,
+    pub has_normalization: bool,
     pub routed_scaling_factor: f64,
     pub selection_bias: bool,
     pub shared_expert_gated: bool,
@@ -188,13 +191,18 @@ pub fn unsupported_reason(facts: &SupportFacts) -> Option<String> {
             None => {}
             Some(routing) => {
                 if routing.sigmoid {
-                    return Some("sigmoid expert scoring is not applied".into());
-                }
-                if routing.has_groups {
-                    return Some("group-limited expert routing is not applied".into());
-                }
-                if routing.selection_bias {
-                    return Some("expert selection bias is not applied".into());
+                    if !routing.selection_bias || !routing.has_normalization {
+                        return Some(
+                            "sigmoid routing requires a selection bias and explicit normalization"
+                                .into(),
+                        );
+                    }
+                    if routing.has_groups && !routing.top_two_groups {
+                        return Some("sigmoid routing requires top-two-sum group scoring".into());
+                    }
+                } else if routing.has_groups || routing.selection_bias || routing.has_normalization
+                {
+                    return Some("this softmax routing variant is not applied".into());
                 }
                 if routing.shared_expert_gated && moe.has_shared_expert {
                     return Some("a gated shared expert is not applied".into());
@@ -250,6 +258,8 @@ struct Plan {
     moe_layers: Option<Vec<bool>>,
     mla: Option<MlaConfig>,
     routing: Option<ExpertRoutingConfig>,
+    normalization: Option<ExpertNormalizationMode>,
+    latent_norm_eps: Option<f64>,
     yarn: Option<YarnRopeScaling>,
 }
 
@@ -269,6 +279,16 @@ impl Plan {
         let moe_layers = model_config::mixture_of_experts_layers();
         let mla = model_config::multi_head_latent_attention();
         let routing = model_config::expert_routing();
+        let normalization = model_config::expert_normalization();
+        let latent_norm_eps = model_config::latent_norm_epsilon();
+        if latent_norm_eps.is_some_and(|epsilon| !epsilon.is_finite() || epsilon <= 0.0) {
+            panic!("latent norm epsilon must be finite and positive");
+        }
+        if let (Some(moe), Some(mode)) = (&moe, &normalization)
+            && moe.normalize_top_k == matches!(mode, ExpertNormalizationMode::Never)
+        {
+            panic!("expert normalization conflicts with normalize-top-k");
+        }
         let (scaling, yarn) = match model_config::rope_scaling() {
             None => (RopeScalingFacts::None, None),
             Some(RopeFrequencyScaling::Banded(_)) => (RopeScalingFacts::Banded, None),
@@ -300,6 +320,11 @@ impl Plan {
             routing: routing.as_ref().map(|routing| RoutingFacts {
                 sigmoid: matches!(routing.scoring, ExpertScoring::Sigmoid),
                 has_groups: routing.groups.is_some(),
+                top_two_groups: routing
+                    .groups
+                    .as_ref()
+                    .is_none_or(|groups| matches!(groups.score, ExpertGroupScore::TopTwoSum)),
+                has_normalization: normalization.is_some(),
                 routed_scaling_factor: routing.routed_scaling_factor,
                 selection_bias: routing.selection_bias,
                 shared_expert_gated: routing.shared_expert_gated,
@@ -314,6 +339,8 @@ impl Plan {
             moe_layers,
             mla,
             routing,
+            normalization,
+            latent_norm_eps,
             yarn,
         }
     }
@@ -410,7 +437,7 @@ pub fn weight_tensor_name(layer: u64, suffix: &str) -> String {
         }
         "gate_proj" | "up_proj" | "down_proj" => format!("layers.{layer}.mlp.{suffix}"),
         "router_proj" | "experts_gate_proj" | "experts_up_proj" | "experts_down_proj"
-        | "shared_gate_proj" | "shared_up_proj" | "shared_down_proj" => {
+        | "shared_gate_proj" | "shared_up_proj" | "shared_down_proj" | "selection_bias" => {
             format!("layers.{layer}.moe.{suffix}")
         }
         other => unreachable!("weight_tensor_name: unknown weight suffix '{other}'"),
@@ -462,7 +489,11 @@ fn rmsnorm(
         "Normalization",
         &[attr(
             "epsilon",
-            AttributeValue::FloatValue(plan.config.rms_norm_eps),
+            AttributeValue::FloatValue(if matches!(suffix, "q_a_norm" | "kv_a_norm") {
+                plan.latent_norm_eps.unwrap_or(plan.config.rms_norm_eps)
+            } else {
+                plan.config.rms_norm_eps
+            }),
         )],
         &[
             input.to_string(),
@@ -665,7 +696,9 @@ fn build_latent_attention(
         None,
         None,
     );
-    // DeepSeek-V2/V3 rotate adjacent pairs (`view_as_complex`).
+    // DeepSeek-V2/V3 rotate adjacent pairs (`view_as_complex`). GLM's
+    // interleaved form emits the same pair rotations in a shared permutation
+    // of Q and K, which leaves their dot products and cached attention equal.
     let q_pe = add_node(
         &format!("{prefix}.rope_q"),
         "rope",
@@ -1031,34 +1064,77 @@ fn moe_mlp(
         None,
         None,
     );
+    let mut attributes = vec![
+        attr("experts", AttributeValue::Integer(i64::from(moe.experts))),
+        attr(
+            "top_k",
+            AttributeValue::Integer(i64::from(moe.experts_per_token)),
+        ),
+        attr(
+            "normalize_top_k",
+            AttributeValue::Boolean(moe.normalize_top_k),
+        ),
+        tensor_parallel("experts"),
+    ];
+    let mut inputs = vec![
+        input.to_string(),
+        logits,
+        weight_edge(&weight_tensor_name(layer, "experts_gate_proj")),
+        weight_edge(&weight_tensor_name(layer, "experts_up_proj")),
+        weight_edge(&weight_tensor_name(layer, "experts_down_proj")),
+    ];
+    let sigmoid = plan
+        .routing
+        .as_ref()
+        .is_some_and(|routing| matches!(routing.scoring, ExpertScoring::Sigmoid));
+    if sigmoid {
+        let routing = plan.routing.as_ref().expect("sigmoid routing is declared");
+        let normalization = match plan
+            .normalization
+            .as_ref()
+            .expect("sigmoid normalization is declared")
+        {
+            ExpertNormalizationMode::Never => "never",
+            ExpertNormalizationMode::MultipleExperts => "multiple",
+            ExpertNormalizationMode::Always => "always",
+        };
+        attributes.extend([
+            attr("routing_scoring", AttributeValue::Text("sigmoid".into())),
+            attr(
+                "routing_normalization",
+                AttributeValue::Text(normalization.into()),
+            ),
+            attr(
+                "routing_scale",
+                AttributeValue::FloatValue(routing.routed_scaling_factor),
+            ),
+        ]);
+        if let Some(groups) = &routing.groups {
+            attributes.extend([
+                attr(
+                    "routing_group_count",
+                    AttributeValue::Integer(i64::from(groups.count)),
+                ),
+                attr(
+                    "routing_group_selected",
+                    AttributeValue::Integer(i64::from(groups.per_token)),
+                ),
+            ]);
+        }
+        inputs.push(weight_edge(&weight_tensor_name(layer, "selection_bias")));
+    }
     let mut routed = add_node(
         &format!("{prefix}.experts"),
         "moe-experts",
         "LinearAlgebra",
-        &[
-            attr("experts", AttributeValue::Integer(i64::from(moe.experts))),
-            attr(
-                "top_k",
-                AttributeValue::Integer(i64::from(moe.experts_per_token)),
-            ),
-            attr(
-                "normalize_top_k",
-                AttributeValue::Boolean(moe.normalize_top_k),
-            ),
-            tensor_parallel("experts"),
-        ],
-        &[
-            input.to_string(),
-            logits,
-            weight_edge(&weight_tensor_name(layer, "experts_gate_proj")),
-            weight_edge(&weight_tensor_name(layer, "experts_up_proj")),
-            weight_edge(&weight_tensor_name(layer, "experts_down_proj")),
-        ],
+        &attributes,
+        &inputs,
         &shape(vec![sequence_length, hidden_size]),
         None,
     );
     // Scaling every routing weight by `s` scales the routed output by `s`.
-    if let Some(routing) = &plan.routing
+    if !sigmoid
+        && let Some(routing) = &plan.routing
         && routing.routed_scaling_factor != 1.0
     {
         routed = add_node(
@@ -1264,6 +1340,8 @@ mod tests {
             routing: Some(RoutingFacts {
                 sigmoid: false,
                 has_groups: false,
+                top_two_groups: true,
+                has_normalization: false,
                 routed_scaling_factor: 1.0,
                 selection_bias: false,
                 shared_expert_gated: false,
@@ -1320,6 +1398,26 @@ mod tests {
             ..v2_lite()
         };
         assert_eq!(unsupported_reason(&unit_factor), None);
+        let sigmoid = SupportFacts {
+            routing: Some(RoutingFacts {
+                sigmoid: true,
+                has_groups: true,
+                top_two_groups: true,
+                has_normalization: true,
+                selection_bias: true,
+                ..v2_lite().routing.unwrap()
+            }),
+            ..v2_lite()
+        };
+        assert_eq!(unsupported_reason(&sigmoid), None);
+        let bad_groups = SupportFacts {
+            routing: Some(RoutingFacts {
+                top_two_groups: false,
+                ..sigmoid.routing.clone().unwrap()
+            }),
+            ..sigmoid
+        };
+        refused(bad_groups);
     }
 
     #[test]
